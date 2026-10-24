@@ -1,19 +1,18 @@
 """Alice skill backend with a task queue for the home computer.
 
 Flow:
-  1. Alice sends a phrase  -> POST "/"   : simple answers (time, date) are computed
-     here at once; everything else is queued and Alice hears "приняла".
+  1. Alice sends a phrase  -> POST "/"   : simple answers (time, date) are computed here at
+     once; anything else is queued, and the handler waits a few seconds for the PC so a fast
+     command (browser, disk space) is answered in the same turn.
   2. The PC polls          -> GET  /pending : the oldest task is handed out once.
   3. The PC answers        -> POST /answer : the answer is stored for the next turn.
   4. Alice asks again      -> POST "/"   : the stored answer is spoken and cleared.
 
-Simple questions must be answered in the same turn: Alice keeps listening for only
-a few seconds after a reply, so a two-turn flow ("приняла" -> wait -> "что там")
-only works for tasks the PC can finish quickly.
-
-A single owner uses the skill, so one queue and one answer slot are enough.
+Alice keeps listening for only a few seconds after a reply, so the two-turn flow
+("приняла" -> wait -> "что там") is a fallback, not the normal path.
 """
 
+import asyncio
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -24,6 +23,8 @@ app = FastAPI()
 
 TASK_TTL_SECONDS = 180
 ANSWER_TTL_SECONDS = 900
+# Alice gives a skill 4.5 seconds; keep a margin for the network round trip.
+WAIT_FOR_PC_SECONDS = 3.8
 
 # Moscow has been UTC+3 all year round since 2014, so a fixed offset needs no tzdata.
 MSK = timezone(timedelta(hours=3))
@@ -37,7 +38,7 @@ WEEKDAYS = (
 )
 
 PENDING: "OrderedDict[str, dict]" = OrderedDict()
-ANSWER: dict = {"text": None, "at": 0.0}
+ANSWER: dict = {"text": None, "at": 0.0, "task": None}
 
 TIME_WORDS = (
     "который час", "сколько время", "сколько времени", "сколько сейчас времени",
@@ -55,8 +56,13 @@ def _gc() -> None:
             break
         PENDING.pop(task_id, None)
     if ANSWER["text"] is not None and now - ANSWER["at"] > ANSWER_TTL_SECONDS:
-        ANSWER["text"] = None
-        ANSWER["at"] = 0.0
+        _clear_answer()
+
+
+def _clear_answer() -> None:
+    ANSWER["text"] = None
+    ANSWER["at"] = 0.0
+    ANSWER["task"] = None
 
 
 def _alice_response(body: dict, text: str) -> dict:
@@ -103,8 +109,7 @@ async def alice(request: Request) -> dict:
     asked_for_result = any(word in lowered for word in RESULT_WORDS)
     if ANSWER["text"] is not None and (asked_for_result or not utterance):
         text = ANSWER["text"]
-        ANSWER["text"] = None
-        ANSWER["at"] = 0.0
+        _clear_answer()
         return _alice_response(body, text)
 
     if asked_for_result and ANSWER["text"] is None:
@@ -115,6 +120,17 @@ async def alice(request: Request) -> dict:
 
     task_id = f"t{int(time.time() * 1000)}"
     PENDING[task_id] = {"text": utterance, "at": time.time()}
+
+    # Wait for the PC: fast local commands come back in well under a second, and answering
+    # them in this same turn is what keeps the Alice dialog natural.
+    deadline = time.time() + WAIT_FOR_PC_SECONDS
+    while time.time() < deadline:
+        if ANSWER["text"] is not None and ANSWER["task"] == task_id:
+            text = ANSWER["text"]
+            _clear_answer()
+            return _alice_response(body, text)
+        await asyncio.sleep(0.15)
+
     return _alice_response(body, "Приняла. Скажи «что там» через несколько секунд.")
 
 
@@ -136,6 +152,7 @@ async def answer(request: Request) -> dict:
         return {"ok": False, "reason": "empty answer"}
     ANSWER["text"] = text[:900]
     ANSWER["at"] = time.time()
+    ANSWER["task"] = body.get("id")
     return {"ok": True, "queued": True}
 
 
