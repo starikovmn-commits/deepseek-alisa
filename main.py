@@ -65,6 +65,9 @@ async def alice(request: Request) -> dict:
         ANSWER["at"] = 0.0
         return _alice_response(body, text)
 
+    if asked_for_result and ANSWER["text"] is None:
+        return _alice_response(body, "Пока ничего нет. Скажи задачу, и я передам её компьютеру.")
+
     if not utterance:
         return _alice_response(body, "Слушаю.")
 
