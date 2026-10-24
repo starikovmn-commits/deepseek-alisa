@@ -1,17 +1,22 @@
 """Alice skill backend with a task queue for the home computer.
 
 Flow:
-  1. Alice sends a phrase  -> POST "/"   : the task is queued, Alice hears "приняла".
+  1. Alice sends a phrase  -> POST "/"   : simple answers (time, date) are computed
+     here at once; everything else is queued and Alice hears "приняла".
   2. The PC polls          -> GET  /pending : the oldest task is handed out once.
   3. The PC answers        -> POST /answer : the answer is stored for the next turn.
   4. Alice asks again      -> POST "/"   : the stored answer is spoken and cleared.
 
+Simple questions must be answered in the same turn: Alice keeps listening for only
+a few seconds after a reply, so a two-turn flow ("приняла" -> wait -> "что там")
+only works for tasks the PC can finish quickly.
+
 A single owner uses the skill, so one queue and one answer slot are enough.
 """
 
-import os
 import time
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request
 
@@ -20,8 +25,26 @@ app = FastAPI()
 TASK_TTL_SECONDS = 180
 ANSWER_TTL_SECONDS = 900
 
+# Moscow has been UTC+3 all year round since 2014, so a fixed offset needs no tzdata.
+MSK = timezone(timedelta(hours=3))
+
+MONTHS = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+WEEKDAYS = (
+    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
+)
+
 PENDING: "OrderedDict[str, dict]" = OrderedDict()
 ANSWER: dict = {"text": None, "at": 0.0}
+
+TIME_WORDS = (
+    "который час", "сколько время", "сколько времени", "сколько сейчас времени",
+    "время сейчас", "чей час",
+)
+DATE_WORDS = ("какое сегодня число", "какое число", "какая сегодня дата", "какое сегодня")
+WEEKDAY_WORDS = ("какой сегодня день", "какой день недели", "какой сегодня день недели")
 
 
 def _gc() -> None:
@@ -44,6 +67,20 @@ def _alice_response(body: dict, text: str) -> dict:
     }
 
 
+def fast_answer(utterance: str) -> "str | None":
+    """Answer questions that need no computer at all, in the same turn."""
+    low = utterance.lower()
+    if any(word in low for word in TIME_WORDS):
+        return datetime.now(MSK).strftime("Сейчас %H:%M")
+    if any(word in low for word in DATE_WORDS):
+        now = datetime.now(MSK)
+        return f"Сегодня {now.day} {MONTHS[now.month - 1]} {now.year} года."
+    if any(word in low for word in WEEKDAY_WORDS):
+        now = datetime.now(MSK)
+        return f"Сегодня {WEEKDAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]}."
+    return None
+
+
 RESULT_WORDS = ("что там", "готово", "результат", "что слышно", "отчёт", "отчет")
 
 
@@ -58,6 +95,11 @@ async def alice(request: Request) -> dict:
     _gc()
     lowered = utterance.lower()
 
+    if utterance:
+        quick = fast_answer(utterance)
+        if quick:
+            return _alice_response(body, quick)
+
     asked_for_result = any(word in lowered for word in RESULT_WORDS)
     if ANSWER["text"] is not None and (asked_for_result or not utterance):
         text = ANSWER["text"]
@@ -66,15 +108,14 @@ async def alice(request: Request) -> dict:
         return _alice_response(body, text)
 
     if asked_for_result and ANSWER["text"] is None:
-        return _alice_response(body, "Пока ничего нет. Скажи задачу, и я передам её компьютеру.")
+        return _alice_response(body, "Ещё думаю. Спроси «что там» чуть позже.")
 
     if not utterance:
         return _alice_response(body, "Слушаю.")
 
     task_id = f"t{int(time.time() * 1000)}"
     PENDING[task_id] = {"text": utterance, "at": time.time()}
-    prefix = "Есть готовый ответ, скажи «что там». " if ANSWER["text"] is not None else ""
-    return _alice_response(body, f"{prefix}Приняла: {utterance}. Скажи «что там», когда будет готово.")
+    return _alice_response(body, "Приняла. Скажи «что там» через несколько секунд.")
 
 
 @app.get("/pending")
