@@ -43,7 +43,15 @@ WEEKDAYS = (
 )
 
 PENDING: "OrderedDict[str, dict]" = OrderedDict()
-ANSWER: dict = {"text": None, "at": 0.0}
+# One answer slot, but each answer remembers which task it belongs to: a request
+# waiting in the same turn takes only its own answer, never someone else's.
+ANSWER: dict = {"text": None, "at": 0.0, "id": None}
+
+
+def _clear_answer() -> None:
+    ANSWER["text"] = None
+    ANSWER["at"] = 0.0
+    ANSWER["id"] = None
 
 TIME_WORDS = (
     "который час", "сколько время", "сколько времени", "сколько сейчас времени",
@@ -61,8 +69,7 @@ def _gc() -> None:
             break
         PENDING.pop(task_id, None)
     if ANSWER["text"] is not None and now - ANSWER["at"] > ANSWER_TTL_SECONDS:
-        ANSWER["text"] = None
-        ANSWER["at"] = 0.0
+        _clear_answer()
 
 
 def _alice_response(body: dict, text: str, end: bool = False) -> dict:
@@ -118,8 +125,7 @@ async def alice(request: Request) -> dict:
     asked_for_result = any(word in lowered for word in RESULT_WORDS)
     if ANSWER["text"] is not None and (asked_for_result or not utterance):
         text = ANSWER["text"]
-        ANSWER["text"] = None
-        ANSWER["at"] = 0.0
+        _clear_answer()
         return _alice_response(body, text)
 
     if asked_for_result and ANSWER["text"] is None:
@@ -135,10 +141,9 @@ async def alice(request: Request) -> dict:
     # asks one phrase instead of two. Slow work still falls back to "что там".
     deadline = time.time() + WAIT_SECONDS
     while time.time() < deadline:
-        if ANSWER["text"] is not None:
+        if ANSWER["text"] is not None and ANSWER["id"] in (None, task_id):
             text = ANSWER["text"]
-            ANSWER["text"] = None
-            ANSWER["at"] = 0.0
+            _clear_answer()
             PENDING.pop(task_id, None)
             return _alice_response(body, text)
         await asyncio.sleep(WAIT_STEP_SECONDS)
@@ -164,6 +169,7 @@ async def answer(request: Request) -> dict:
         return {"ok": False, "reason": "empty answer"}
     ANSWER["text"] = text[:900]
     ANSWER["at"] = time.time()
+    ANSWER["id"] = str(body.get("id") or "").strip() or None
     return {"ok": True, "queued": True}
 
 
