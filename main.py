@@ -65,11 +65,11 @@ def _gc() -> None:
         ANSWER["at"] = 0.0
 
 
-def _alice_response(body: dict, text: str) -> dict:
+def _alice_response(body: dict, text: str, end: bool = False) -> dict:
     return {
         "version": body.get("version", "1.0"),
         "session": body.get("session", {}),
-        "response": {"end_session": False, "text": text},
+        "response": {"end_session": end, "text": text},
     }
 
 
@@ -89,6 +89,13 @@ def fast_answer(utterance: str) -> "str | None":
 
 RESULT_WORDS = ("что там", "готово", "результат", "что слышно", "отчёт", "отчет")
 
+# Voice command that hands control back to Alice: the skill keeps the session open,
+# so without this the user stays "inside" it until the platform times out.
+EXIT_WORDS = (
+    "верни алису", "вернись к алисе", "верни меня алисе", "переключи на алису",
+    "хватит", "отключись", "закончим", "выход", "до свидания",
+)
+
 
 @app.post("/")
 async def alice(request: Request) -> dict:
@@ -105,6 +112,8 @@ async def alice(request: Request) -> dict:
         quick = fast_answer(utterance)
         if quick:
             return _alice_response(body, quick)
+        if any(word in lowered for word in EXIT_WORDS):
+            return _alice_response(body, "Хорошо, возвращаю Алису.", end=True)
 
     asked_for_result = any(word in lowered for word in RESULT_WORDS)
     if ANSWER["text"] is not None and (asked_for_result or not utterance):
